@@ -1,0 +1,144 @@
+# ============================================================================
+# 【このファイルは何？】
+#   GitHub Actions（GitHubが無料で提供している自動実行の仕組み）の設定ファイル。
+#   .github/workflows/ に置いた *.yml を GitHub が自動で読み取り、
+#   ここに書いた「いつ・どこで・何をするか」のとおりに処理を実行してくれる。
+#
+# 【このワークフローがやること】
+#   ソースコードを GitHub に push したとき / プルリクエストを出したときに、
+#   GitHubのサーバ上で以下を自動実行して、壊れたコードの混入を防ぐ。
+#     1. PHPの実行環境を用意する
+#     2. composer install で必要なライブラリを入れる
+#     3. Pint（整形ツール）でコードの書き方をチェックする
+#     4. PHPUnit（テストツール）で Unitテストを流す
+#   → 結果は GitHub の「Actions」タブや、プルリクエスト画面の緑✓/赤×で確認できる。
+#
+# 【用語メモ】
+#   ワークフロー(workflow) : このファイル1つ分の自動処理のまとまり
+#   ジョブ(job)            : ワークフローの中の作業単位。1台の仮想マシンで動く
+#   ステップ(step)         : ジョブの中の1コマンド。上から順番に実行される
+#   ランナー(runner)       : GitHubが用意する使い捨ての仮想マシン。毎回まっさらな状態
+#
+# 【なぜテストがUnitだけ？】
+#   このシステムは本番だと Windows認証(IIS) + SQL Server で動いているが、
+#   GitHubのランナー(Linux)ではそれらを再現できない。
+#   そこでCIでは、DBに依存しない Unitテストだけを対象にしている。
+#   （テストの書き方・ローカルでの流し方は TESTING.md を参照）
+# ============================================================================
+
+# ワークフローの表示名。GitHubの「Actions」タブにこの名前で一覧表示される。
+name: Tests
+
+# 【いつ動かすか】のトリガー設定。
+#   push         : develop / main ブランチに直接コミットが入ったとき
+#   pull_request : develop / main 宛てのプルリクエストが作られた・更新されたとき
+# feat/xxx や bug/xxx ブランチで作業中は動かず、プルリクを出した時点で検証が走る。
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+# 【何をするか】の本体。jobs の下にジョブを並べる（今回は phpunit の1つだけ）。
+jobs:
+  # "phpunit" はジョブの識別名。自由に付けてよく、Actions画面にこの名前で出る。
+  phpunit:
+    # このジョブを動かす仮想マシンの種類。ubuntu（Linux）の最新版を使う。
+    # PHPは最初から入っていないので、下の「Setup PHP」ステップで自分で入れる。
+    runs-on: ubuntu-latest
+
+    # 【環境変数】このジョブの全ステップに渡される設定値。
+    # Laravelは .env や config を通じてこの値を読み、DBの接続先を決める。
+    #
+    #   本番はSQL Server(sqlsrv)だが、GitHubのランナーには
+    #   SQL Server用のPHPドライバが入っていないため、そのままだとエラーになる。
+    #   そこでCIの間だけ、PHPに標準で入る sqlite に差し替えている。
+    #   ':memory:' はファイルを作らずメモリ上だけで完結するDBの指定。
+    #   → 実際の業務DBには一切つながらないので安全。
+    #
+    #   なお tests/Feature 配下は Laravel を作ったときに付いてくる
+    #   サンプル(ExampleTest)しか無く、Windows認証やSQL Serverが前提の
+    #   実際の画面のテストは含まれていないため、CIの対象外にしている。
+    env:
+      DB_CONNECTION: sqlite
+      DB_DATABASE: ':memory:'
+
+    # 【ステップ一覧】上から順番に1つずつ実行される。
+    #   uses: … GitHubに公開されている既製の部品（アクション）を呼び出す
+    #   run : … シェルコマンドをそのまま実行する
+    # どれか1つでも失敗すると、そこで止まってジョブ全体が「失敗（赤×）」になる。
+    steps:
+      # ランナーはまっさらな状態なので、まずこのリポジトリのソースを持ってくる。
+      # これをやらないと、以降のステップで見るファイルが何も無い。
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # PHP本体と拡張モジュールをインストールする。
+      #   php-version : composer.json が要求しているバージョンに合わせて 8.4
+      #   extensions  : Laravelの動作に必要な拡張の一覧。
+      #                 pdo_sqlite は上で指定したsqliteを使うために必須。
+      #                 intl は日本語（日付・数値の書式）まわりで使う。
+      #   coverage    : テストカバレッジの計測。今回は不要なので none にして高速化。
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, bcmath, ctype, curl, dom, fileinfo, json, pdo, pdo_sqlite, tokenizer, xml, zip, intl
+          coverage: none
+
+      # 次の「キャッシュ」ステップで使う、composerのダウンロード先フォルダを調べる。
+      #   $GITHUB_OUTPUT に "dir=..." と書き込むと、その値を後続ステップから
+      #   ${{ steps.composer-cache.outputs.dir }} という書き方で参照できる。
+      #   （id: を付けておくことで、そのステップを名前で指せるようになる）
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      # ライブラリを毎回インターネットから落とすと時間がかかるので、
+      # 前回ダウンロードしたものを保存しておいて再利用する（キャッシュ）。
+      #   key          : composer.lock の中身から作った目印。
+      #                  lockが変わればkeyも変わり、新しく取り直される。
+      #   restore-keys : 完全一致のkeyが無いとき、前方一致で近いものを流用する。
+      # ※ このステップは高速化のためのもので、無くても結果は同じ。
+      - name: Cache composer packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-composer-
+
+      # vendor/ 配下にライブラリ一式を入れる（composer.lock に書かれた版で固定）。
+      #   --no-interaction     : 質問を出さない（自動実行なので人が答えられない）
+      #   --optimize-autoloader: クラス読み込みを速くする
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      # Laravelは .env が無いと起動できないが、.env はパスワード等を含むため
+      # Gitで管理していない。そこでCIでは雛形の .env.example をコピーして代用する。
+      # （テスト実行時の細かい設定は phpunit.xml 側の指定が優先される）
+      - name: Prepare environment file
+        run: cp .env.example .env
+
+      # APP_KEY（暗号化・セッションで使う鍵）を発行して .env に書き込む。
+      # これが空だとアプリ起動時にエラーになるため必須。
+      # 毎回その場で作り捨てる値なので、本番の鍵とは無関係。
+      - name: Generate application key
+        run: php artisan key:generate
+
+      # Laravel Pint でコードの書き方（インデント・改行など）が
+      # 規約どおりか確認する。--test は「直さずチェックだけ」の意味。
+      #
+      #   continue-on-error: true は「失敗しても次に進む」という指定。
+      #   今は pint.json が未整備で既存コード全体が未整形のため、
+      #   ここで止めるとCIが常に赤×になってしまう。そのため今は警告表示に留める。
+      #   （pint.json を整備できたら、この行を外して本当に失敗させる想定）
+      - name: Check code style (Pint)
+        run: vendor/bin/pint --test
+        continue-on-error: true
+
+      # PHPUnitのテストを実行する。--testsuite=Unit で
+      # tests/Unit 配下（DBに依存しないテスト）だけに絞っている。
+      # ここが失敗するとジョブが赤×になり、プルリクの画面で気づける。
+      - name: Run Unit tests
+        run: php artisan test --testsuite=Unit
