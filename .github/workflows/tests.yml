@@ -47,6 +47,16 @@ jobs:
     # PHPは最初から入っていないので、下の「Setup PHP」ステップで自分で入れる。
     runs-on: ubuntu-latest
 
+    # 【作業ディレクトリ】run: で実行するコマンドの実行場所。      # add start
+    #   Laravelアプリ本体はリポジトリ直下ではなく sample-app/ 配下にあるため、
+    #   ここを指定しないと composer install が composer.json を見つけられず失敗する。
+    #   ※ uses: の各アクション（checkout/cache 等）には効かない。
+    #     path: の指定が必要な場合は個別に書くこと。
+    defaults:
+      run:
+        working-directory: sample-app
+                                                                  # add end
+
     # 【環境変数】このジョブの全ステップに渡される設定値。
     # Laravelは .env や config を通じてこの値を読み、DBの接続先を決める。
     #
