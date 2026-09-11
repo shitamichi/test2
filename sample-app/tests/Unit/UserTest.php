@@ -19,7 +19,7 @@ class UserTest extends TestCase
      * #[Fillable] に項目が増えると、リクエストの値をそのまま保存できる
      * 範囲が広がる。意図しない追加に気づくための確認。
      */
-    public function test_fillable_attributes_are_limited_to_expected_columns(): void
+    public function test_fillable attributes_are_limited_to_expected_columns(): void
     {
         $user = new User;
 
