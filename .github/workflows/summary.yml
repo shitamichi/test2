@@ -21,6 +21,7 @@
 # 【コストに注意】
 #   このワークフローはプルリクが作られる / 更新されるたびに Claude を1回呼ぶ。
 #   （CLAUDE_CODE_OAUTH_TOKEN のサブスク枠、またはAPI従量課金を消費する）
+#   実測: 1回あたり 約 $0.16（2026-09-11 時点。差分の量で変動する）  # add
 #   呼び出し回数を減らしたい場合は下の on: を調整する。
 # ============================================================================
 
@@ -59,8 +60,11 @@ on:
 
 # 【権限】このワークフローのGITHUB_TOKENに与える権限。必要最小限にする。
 #   contents: read  … リポジトリのソースを読むため（差分の取得に必要）
-#   id-token: write … claude-code-action が内部で使う想定のため付与。
-#                     不要と確認できたら外してよい。
+#   id-token: write … 【必須】外すと動かない。                       # del/add
+#                     claude-code-action はこの権限でOIDCトークンを取得し、
+#                     GitHub Appトークンに交換して認証している。
+#                     （実行ログに "Requesting OIDC token" →
+#                       "Exchanging OIDC token for app token" が出る）
 #   ※ PR画面へのコメント投稿はしない設計なので pull-requests: write は付けない。
 #     （要約はジョブサマリにだけ出す）
 permissions:
