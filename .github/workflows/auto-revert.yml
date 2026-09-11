@@ -1,0 +1,286 @@
+# ============================================================================
+# 【このファイルは何？】
+#   GitHub Actions の設定ファイル。
+#   main / develop への直pushで Unitテストが失敗したとき、
+#   そのコミットを打ち消す「切り戻しPR」を自動で作成する。
+#
+# 【自動マージはしない】
+#   PRを作るところまでが仕事。マージするかどうかは必ず人が判断する。
+#   テストが不安定（flaky）で落ちただけの可能性や、切り戻しより
+#   前進修正（fix commit）のほうが適切な場合があるため。
+#
+# 【force push は絶対にしない】
+#   git revert（打ち消しコミットを新しく積む）だけを使う。
+#   reset --hard + force push は、既にpullした人のローカルを壊すため採用しない。
+#
+# 【Unitテストの失敗に限定している】
+#   Tests ワークフローは composer install の失敗やランナー障害でも赤くなる。
+#   それらで切り戻すのは誤りなので、失敗したステップ名が
+#   "Run Unit tests" のときだけ動くようAPIで判定している。
+#   （Pint は continue-on-error なので、そもそも赤の原因にならない）
+#
+# 【この仕組みは「保険」であって本命ではない】
+#   本命はブランチ保護（Settings → Rules）で
+#     ・Require a pull request before merging
+#     ・Require status checks to pass → phpunit
+#   を有効にし、壊れたコードが main に入らないようにすること。
+#   このワークフローは、直pushが起きてしまった場合の後追い対応。
+#
+# 【既知の制限】
+#   1回のpushに複数コミットが含まれる場合、打ち消すのは
+#   Testsが走った最新の1コミット（head_sha）だけ。
+#   範囲まとめての切り戻しが要るときは手動で対応すること。
+#
+# 【関連ファイル】
+#   tests.yml   : Pint + PHPUnit（このワークフローの起動元）
+#   summary.yml : 差分のAI要約
+#   claude.yml  : @claude メンション対応
+# ============================================================================
+
+# ワークフローの表示名。GitHubの「Actions」タブにこの名前で一覧表示される。
+name: Auto Revert PR
+
+# 【いつ動かすか】
+#   workflow_run : 別のワークフロー（ここでは Tests）の完了を合図に起動する。
+#   branches     : 起動元ワークフローが動いたブランチで絞る。
+#                  main / develop で走った Tests だけを対象にする。
+#
+#   ※ workflow_run は「既定ブランチ(main)にあるこのファイルの内容」で動く。
+#     作業ブランチ上で編集しても、mainにマージするまで反映されない。
+on:
+  workflow_run:
+    workflows: ["Tests"]
+    types: [completed]
+    branches: [main, develop]
+
+# 【権限】
+#   contents: write       … 切り戻し用ブランチをpushするため
+#   pull-requests: write  … 切り戻しPRを作成するため
+#   actions: read         … どのステップが失敗したかをAPIで調べるため
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  revert:
+    runs-on: ubuntu-latest
+
+    # 【起動条件】ここで大半のケースを足切りする。
+    #   conclusion == 'failure' : Tests が赤で終わったときだけ
+    #   event      == 'push'    : 直pushが原因のときだけ。
+    #                             PR上の失敗は「マージしなければよい」だけなので対象外。
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'push'
+
+    steps:
+      # 【判定】失敗したのが本当に Unitテストのステップかを確認する。
+      #   起動元ワークフローの各ステップの結果をGitHub REST APIで取得し、
+      #   "Run Unit tests" が failure かどうかを見る。
+      #   composer install の失敗やランナー障害では切り戻さない。
+      #
+      #   ※ gh run view --json jobs ではなく gh api を使うのは、
+      #     REST APIのほうがレスポンスの形が公式に定義されていて安定だから。
+      #       { total_count, jobs: [ { name, status, conclusion,
+      #           steps: [ { name, status, conclusion, number } ] } ] }
+      - name: Check whether the Unit test step failed
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          # per_page=100 で1ページに収める（Tests のジョブは phpunit の1つだけ）
+          gh api "repos/$REPO/actions/runs/$RUN_ID/jobs?per_page=100" > jobs.json
+
+          # 失敗したステップ名の一覧（ログとジョブサマリ表示に使う）
+          FAILED="$(jq -r '[.jobs[].steps[]? | select(.conclusion == "failure") | .name] | join(", ")' jobs.json)"
+          echo "失敗したステップ: ${FAILED:-なし}"
+          echo "failed_steps=${FAILED}" >> "$GITHUB_OUTPUT"
+
+          if jq -e '[.jobs[].steps[]? | select(.name == "Run Unit tests" and .conclusion == "failure")] | length > 0' jobs.json > /dev/null; then
+            echo "unit_failed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "unit_failed=false" >> "$GITHUB_OUTPUT"
+            echo "Unitテスト以外の失敗のため、切り戻しは行わない。"
+          fi
+
+      # 対象ブランチの全履歴を取得する。
+      # revert には対象コミットとその親が必要なので fetch-depth: 0 が要る。
+      - name: Checkout
+        if: steps.check.outputs.unit_failed == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_branch }}
+
+      # 【切り戻しブランチの作成】
+      #   打ち消しコミットを作り、専用ブランチとしてpushする。
+      #   main / develop には一切触れない（PR経由で人がマージする）。
+      #
+      #   status の意味（後続ステップの分岐とサマリ表示に使う）
+      #     created          : 切り戻しブランチを作成できた
+      #     skipped_existing : 同じコミットの切り戻しブランチが既にある
+      #     skipped_revert   : 対象が既に revert コミット（切り戻しの連鎖を防ぐ）
+      #     conflict         : 打ち消しがコンフリクトして自動作成できなかった
+      - name: Create revert branch
+        id: revert
+        if: steps.check.outputs.unit_failed == 'true'
+        env:
+          BAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          SHORT="${BAD_SHA:0:7}"
+          BRANCH="revert/${SHORT}"
+          SUBJECT="$(git log -1 --pretty=format:%s "$BAD_SHA")"
+          echo "branch=$BRANCH"   >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT"     >> "$GITHUB_OUTPUT"
+          echo "subject=$SUBJECT" >> "$GITHUB_OUTPUT"
+
+          # 切り戻しコミットをさらに切り戻す連鎖を防ぐ
+          case "$SUBJECT" in
+            Revert*|revert*)
+              echo "対象が既に切り戻しコミットのため何もしない: $SUBJECT"
+              echo "status=skipped_revert" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          # 同じコミットに対する切り戻しブランチが既にあるなら二重作成しない
+          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+            echo "既に $BRANCH が存在するため何もしない"
+            echo "status=skipped_existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git switch -c "$BRANCH"
+
+          # マージコミットは「どちらの親を残すか」の指定(-m 1)が必要。
+          # 親の数で判定する。
+          PARENTS="$(git cat-file -p "$BAD_SHA" | grep -c '^parent ' || true)"
+          if [ "$PARENTS" -gt 1 ]; then
+            REVERT_OPTS="-m 1"
+          else
+            REVERT_OPTS=""
+          fi
+
+          # shellcheck disable=SC2086
+          if ! git revert --no-edit $REVERT_OPTS "$BAD_SHA"; then
+            # コンフリクトは自動解決しない。中断して人に委ねる。
+            git revert --abort || true
+            echo "切り戻しがコンフリクトしたため自動作成を中止した"
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git push origin "$BRANCH"
+          echo "status=created" >> "$GITHUB_OUTPUT"
+
+      # 【切り戻しPRの作成】自動マージはしない。人が内容を見て判断する。
+      #   本文は --body-file で渡す（シェルの引用崩れを避けるため）。
+      - name: Open revert PR
+        id: pr
+        if: steps.revert.outputs.status == 'created'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE: ${{ github.event.workflow_run.head_branch }}
+          BRANCH: ${{ steps.revert.outputs.branch }}
+          SHORT: ${{ steps.revert.outputs.short }}
+          SUBJECT: ${{ steps.revert.outputs.subject }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## 自動作成された切り戻しPR"
+            echo
+            echo "\`$BASE\` への直pushで **Unitテストが失敗した**ため、自動で作成しました。"
+            echo
+            echo "| 項目 | 内容 |"
+            echo "|---|---|"
+            echo "| 対象コミット | \`$SHORT\` $SUBJECT |"
+            echo "| 失敗したCI | [Tests の実行結果]($RUN_URL) |"
+            echo
+            echo "### マージ前に必ず確認してください"
+            echo "1. 本当にこのコミットが原因か（テストが不安定で落ちただけではないか）"
+            echo "2. 切り戻しではなく**前進修正**のほうが適切ではないか"
+            echo "3. このコミットに依存する後続コミットが無いか"
+            echo
+            echo "切り戻しが不要と判断した場合は、このPRを閉じてブランチを削除してください。"
+            echo
+            echo "---"
+            echo "*このPRは auto-revert.yml により自動生成されました。*"
+          } > "$RUNNER_TEMP/pr-body.md"
+
+          URL="$(gh pr create \
+            --base "$BASE" \
+            --head "$BRANCH" \
+            --title "Revert \"$SUBJECT\" ($SHORT) — Unitテスト失敗のため" \
+            --body-file "$RUNNER_TEMP/pr-body.md")"
+
+          echo "pr_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "作成したPR: $URL"
+
+      # 【結果の通知】何をした／しなかったのかをジョブサマリに残す。
+      #   if: always() … 途中で止まった場合も理由を表示するため必ず実行する。
+      - name: Publish result
+        if: always()
+        env:
+          UNIT_FAILED: ${{ steps.check.outputs.unit_failed }}
+          FAILED_STEPS: ${{ steps.check.outputs.failed_steps }}
+          STATUS: ${{ steps.revert.outputs.status }}
+          BRANCH: ${{ steps.revert.outputs.branch }}
+          SHORT: ${{ steps.revert.outputs.short }}
+          PR_URL: ${{ steps.pr.outputs.pr_url }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          {
+            echo "## ⏪ 自動切り戻しの判定結果"
+            echo
+            echo "- 起動元: [Tests の実行結果]($RUN_URL)"
+            echo "- 失敗したステップ: ${FAILED_STEPS:-（取得できず）}"
+            echo
+
+            if [ "$UNIT_FAILED" != "true" ]; then
+              echo "**切り戻しは行いませんでした。**"
+              echo
+              echo "Unitテスト以外の失敗（composer install の失敗、ランナー障害など）は"
+              echo "コードの問題とは限らないため、対象外としています。"
+            else
+              case "${STATUS:-}" in
+                created)
+                  echo "**切り戻しPRを作成しました: $PR_URL**"
+                  echo
+                  echo "> マージすると \`$SHORT\` の変更が打ち消されます。"
+                  echo "> 自動マージはしていません。内容を確認してから判断してください。"
+                  ;;
+                skipped_existing)
+                  echo "**何もしませんでした**（\`$BRANCH\` が既に存在するため）。"
+                  ;;
+                skipped_revert)
+                  echo "**何もしませんでした**（対象が既に切り戻しコミットのため）。"
+                  ;;
+                conflict)
+                  echo "**自動作成に失敗しました（コンフリクト）。**"
+                  echo
+                  echo "手動での対応が必要です:"
+                  echo '```bash'
+                  echo "git switch main && git pull"
+                  echo "git switch -c revert/$SHORT"
+                  echo "git revert $SHORT   # コンフリクトを解消してコミット"
+                  echo "git push -u origin revert/$SHORT"
+                  echo '```'
+                  ;;
+                *)
+                  echo "**判定できませんでした。** 上のステップのログを確認してください。"
+                  ;;
+              esac
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
