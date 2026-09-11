@@ -14,6 +14,16 @@
 #     - ブランチ保護の必須チェックに誤って含めてしまう
 #   といった問題が出るため、ワークフローごと分離している。
 #
+# 【このファイルを編集するPRでは、要約は動かない】               # add start
+#   claude-code-action は、PRのワークフローファイルが既定ブランチ(main)と
+#   同一内容でないとスキップされる（PRでワークフローを書き換えて
+#   トークンを悪用されるのを防ぐための検証）。ログには
+#     Warning: Skipping action due to workflow validation
+#   が出るが、これは異常ではなくCIも緑のままになる。
+#   → このファイルを直したPRでは動作確認できない。
+#     先にマージし、ワークフローを触らない別PRで確認すること。
+#                                                                # add end
+#
 # 【関連ファイル】
 #   tests.yml  : Pint + PHPUnit（品質ゲート）
 #   claude.yml : Issue / PRコメントの @claude メンションに応答する
@@ -223,9 +233,16 @@ jobs:
             if [ -f claude-summary.md ]; then
               cat claude-summary.md
             else
-              echo "要約の生成に失敗しました。"
+              echo "要約が生成されませんでした（失敗、またはスキップ）。"
               echo "前ステップ \"Summarize with Claude\" のログを確認してください。"
-              echo "（よくある原因: CLAUDE_CODE_OAUTH_TOKEN の未設定または期限切れ）"
+              echo
+              echo "よくある原因:"
+              echo "1. **このPRがワークフローファイル自体を変更している**"
+              echo "   claude-code-action は、PRのワークフローが既定ブランチ(main)と"
+              echo "   同一内容でない場合、セキュリティ上スキップされる"
+              echo "   (\"Workflow validation failed\" がログに出る)。"
+              echo "   → このPRをマージすれば以降は動作する。異常ではない。"
+              echo "2. CLAUDE_CODE_OAUTH_TOKEN の未設定または期限切れ"
             fi
             echo
             echo "---"
