@@ -14,6 +14,16 @@
 #     - ブランチ保護の必須チェックに誤って含めてしまう
 #   といった問題が出るため、ワークフローごと分離している。
 #
+# 【このファイルを編集するPRでは、要約は動かない】               # add start
+#   claude-code-action は、PRのワークフローファイルが既定ブランチ(main)と
+#   同一内容でないとスキップされる（PRでワークフローを書き換えて
+#   トークンを悪用されるのを防ぐための検証）。ログには
+#     Warning: Skipping action due to workflow validation
+#   が出るが、これは異常ではなくCIも緑のままになる。
+#   → このファイルを直したPRでは動作確認できない。
+#     先にマージし、ワークフローを触らない別PRで確認すること。
+#                                                                # add end
+#
 # 【関連ファイル】
 #   tests.yml  : Pint + PHPUnit（品質ゲート）
 #   claude.yml : Issue / PRコメントの @claude メンションに応答する
@@ -21,6 +31,7 @@
 # 【コストに注意】
 #   このワークフローはプルリクが作られる / 更新されるたびに Claude を1回呼ぶ。
 #   （CLAUDE_CODE_OAUTH_TOKEN のサブスク枠、またはAPI従量課金を消費する）
+#   実測: 1回あたり 約 $0.16（2026-09-11 時点。差分の量で変動する）  # add
 #   呼び出し回数を減らしたい場合は下の on: を調整する。
 # ============================================================================
 
@@ -59,8 +70,11 @@ on:
 
 # 【権限】このワークフローのGITHUB_TOKENに与える権限。必要最小限にする。
 #   contents: read  … リポジトリのソースを読むため（差分の取得に必要）
-#   id-token: write … claude-code-action が内部で使う想定のため付与。
-#                     不要と確認できたら外してよい。
+#   id-token: write … 【必須】外すと動かない。                       # del/add
+#                     claude-code-action はこの権限でOIDCトークンを取得し、
+#                     GitHub Appトークンに交換して認証している。
+#                     （実行ログに "Requesting OIDC token" →
+#                       "Exchanging OIDC token for app token" が出る）
 #   ※ PR画面へのコメント投稿はしない設計なので pull-requests: write は付けない。
 #     （要約はジョブサマリにだけ出す）
 permissions:
@@ -148,11 +162,20 @@ jobs:
 
       # 【要約の生成】Claudeに差分ファイルを読ませ、要約をMarkdownファイルに書かせる。
       #   claude_args の指定内容
+      #     --model claude-sonnet-5     : 使うモデルの固定。                    # add
+      #                                   未指定でもアクション既定が同じ Sonnet 5 だが、
+      #                                   既定は将来変わりうる（＝コストと挙動が
+      #                                   予告なく変化する）ため明示している。
+      #                                   差分を読んで要約する用途にはSonnetで十分で、
+      #                                   Opus 5 は入出力とも約2.5倍のコストになる。
+      #                                   ※ モデルIDに日付サフィックスは付けない。
+      #                                   ※ これはメインモデルの指定。Claude Codeが
+      #                                     内部の軽量処理に使う補助モデル
+      #                                     （claude-haiku-4-5）は別枠で動く。
       #     --allowedTools "Read,Write" : 使わせるツールをファイル読み書きだけに限定。
       #                                   Bash を許可していないので、差分に不審な
       #                                   コマンドが混ざっていても実行されない。
       #     --max-turns 5               : Claudeの往復回数の上限。暴走とコスト増を防ぐ。
-      #   ※ 使うモデルを固定したい場合は --model を足す（未指定ならアクション既定）。
       #
       #   continue-on-error: true …
       #     要約はあくまで補助情報。トークン切れやAPIエラーでCIを赤×にしないため。
@@ -161,7 +184,7 @@ jobs:
         continue-on-error: true
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          claude_args: '--allowedTools "Read,Write" --max-turns 5'
+          claude_args: '--model claude-sonnet-5 --allowedTools "Read,Write" --max-turns 5'
           prompt: |
             あなたはコードレビューの下準備をする担当です。
 
@@ -210,9 +233,16 @@ jobs:
             if [ -f claude-summary.md ]; then
               cat claude-summary.md
             else
-              echo "要約の生成に失敗しました。"
+              echo "要約が生成されませんでした（失敗、またはスキップ）。"
               echo "前ステップ \"Summarize with Claude\" のログを確認してください。"
-              echo "（よくある原因: CLAUDE_CODE_OAUTH_TOKEN の未設定または期限切れ）"
+              echo
+              echo "よくある原因:"
+              echo "1. **このPRがワークフローファイル自体を変更している**"
+              echo "   claude-code-action は、PRのワークフローが既定ブランチ(main)と"
+              echo "   同一内容でない場合、セキュリティ上スキップされる"
+              echo "   (\"Workflow validation failed\" がログに出る)。"
+              echo "   → このPRをマージすれば以降は動作する。異常ではない。"
+              echo "2. CLAUDE_CODE_OAUTH_TOKEN の未設定または期限切れ"
             fi
             echo
             echo "---"
