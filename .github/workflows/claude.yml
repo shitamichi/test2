@@ -22,3 +22,10 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # 使うモデルの固定。未指定でもアクション既定が同じ Sonnet 5 だが、      # add start
+          # 既定は将来変わりうる（＝コストと挙動が予告なく変化する）ため明示する。
+          # より高性能な Opus 5 に上げる場合は claude-opus-5 に変更する
+          # （入出力とも約2.5倍のコスト）。
+          # ※ モデルIDに日付サフィックスは付けない。
+          claude_args: '--model claude-sonnet-5'
+          #                                                                      # add end
