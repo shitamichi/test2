@@ -1,21 +1,19 @@
 # ============================================================================
 # 【このファイルは何？】
 #   GitHub Actions の設定ファイル。
-#   main / develop への直pushで Unitテストが失敗したとき、
-#   そのコミットを打ち消す「切り戻しPR」を自動で作成する。
+#   main / develop 関連で Unitテストが失敗したとき、警告コメントを自動投稿する。
+#     ・main / develop への「直push」で失敗 → そのコミットにコミットコメント
+#     ・main / develop 宛の「PR」で失敗     → そのPRにコメント
 #
-# 【自動マージはしない】
-#   PRを作るところまでが仕事。マージするかどうかは必ず人が判断する。
-#   テストが不安定（flaky）で落ちただけの可能性や、切り戻しより
-#   前進修正（fix commit）のほうが適切な場合があるため。
-#
-# 【force push は絶対にしない】
-#   git revert（打ち消しコミットを新しく積む）だけを使う。
-#   reset --hard + force push は、既にpullした人のローカルを壊すため採用しない。
+# 【通知だけを行い、コードには一切触れない】
+#   ブランチ作成・コミット・切り戻し（revert）・force push はいっさい行わない。
+#   テストが不安定（flaky）で落ちただけの可能性もあり、前進修正（fix commit）と
+#   切り戻しのどちらが適切かは状況によるため、判断は必ず人に委ねる。
+#   このワークフローの責務は「失敗が見落とされないようにすること」だけ。
 #
 # 【Unitテストの失敗に限定している】
 #   Tests ワークフローは composer install の失敗やランナー障害でも赤くなる。
-#   それらで切り戻すのは誤りなので、失敗したステップ名が
+#   それらで警告するのは誤りなので、失敗したステップ名が
 #   "Run Unit tests" のときだけ動くようAPIで判定している。
 #   （Pint は continue-on-error なので、そもそも赤の原因にならない）
 #
@@ -24,12 +22,7 @@
 #     ・Require a pull request before merging
 #     ・Require status checks to pass → phpunit
 #   を有効にし、壊れたコードが main に入らないようにすること。
-#   このワークフローは、直pushが起きてしまった場合の後追い対応。
-#
-# 【既知の制限】
-#   1回のpushに複数コミットが含まれる場合、打ち消すのは
-#   Testsが走った最新の1コミット（head_sha）だけ。
-#   範囲まとめての切り戻しが要るときは手動で対応すること。
+#   このワークフローは、その後追い・補助。
 #
 # 【関連ファイル】
 #   tests.yml   : Pint + PHPUnit（このワークフローの起動元）
@@ -38,47 +31,54 @@
 # ============================================================================
 
 # ワークフローの表示名。GitHubの「Actions」タブにこの名前で一覧表示される。
-name: Auto Revert PR
+name: Unit Test Failure Notice
 
 # 【いつ動かすか】
 #   workflow_run : 別のワークフロー（ここでは Tests）の完了を合図に起動する。
-#   branches     : 起動元ワークフローが動いたブランチで絞る。
-#                  main / develop で走った Tests だけを対象にする。
 #
 #   ※ workflow_run は「既定ブランチ(main)にあるこのファイルの内容」で動く。
 #     作業ブランチ上で編集しても、mainにマージするまで反映されない。
+#
+#   ※ branches フィルタは使わない。
+#     このフィルタが見るのは起動元の head_branch。
+#     PR起動時の head_branch は PR元ブランチ（feat/xxx 等）になるため、
+#     main / develop で絞るとPRが丸ごと対象外になってしまう。
+#     対象ブランチの判定は後段の "Resolve target" ステップで行う。
 on:
   workflow_run:
     workflows: ["Tests"]
     types: [completed]
-    branches: [main, develop]
 
 # 【権限】
-#   contents: write       … 切り戻し用ブランチをpushするため
-#   pull-requests: write  … 切り戻しPRを作成するため
+#   contents: write       … コミットコメントの投稿に必要（push時）
+#   pull-requests: write  … PRへのコメント投稿に必要（PR時）
 #   actions: read         … どのステップが失敗したかをAPIで調べるため
+#
+#   ※ ブランチ作成やpushは行わないが、コミットコメントのAPIが
+#     contents スコープの write を要求するため contents: write は残している。
 permissions:
   contents: write
   pull-requests: write
   actions: read
 
 jobs:
-  revert:
+  notify:
     runs-on: ubuntu-latest
 
     # 【起動条件】ここで大半のケースを足切りする。
     #   conclusion == 'failure' : Tests が赤で終わったときだけ
-    #   event      == 'push'    : 直pushが原因のときだけ。
-    #                             PR上の失敗は「マージしなければよい」だけなので対象外。
+    #   event                   : 直push と PR の両方を受ける。
+    #                             扱いは同じで、投稿先だけが異なる。
     if: >-
       github.event.workflow_run.conclusion == 'failure' &&
-      github.event.workflow_run.event == 'push'
+      (github.event.workflow_run.event == 'push' ||
+       github.event.workflow_run.event == 'pull_request')
 
     steps:
       # 【判定】失敗したのが本当に Unitテストのステップかを確認する。
       #   起動元ワークフローの各ステップの結果をGitHub REST APIで取得し、
       #   "Run Unit tests" が failure かどうかを見る。
-      #   composer install の失敗やランナー障害では切り戻さない。
+      #   composer install の失敗やランナー障害では何もしない。
       #
       #   ※ gh run view --json jobs ではなく gh api を使うのは、
       #     REST APIのほうがレスポンスの形が公式に定義されていて安定だから。
@@ -105,128 +105,182 @@ jobs:
             echo "unit_failed=true" >> "$GITHUB_OUTPUT"
           else
             echo "unit_failed=false" >> "$GITHUB_OUTPUT"
-            echo "Unitテスト以外の失敗のため、切り戻しは行わない。"
+            echo "Unitテスト以外の失敗のため、コメントは行わない。"
           fi
 
-      # 対象ブランチの全履歴を取得する。
-      # revert には対象コミットとその親が必要なので fetch-depth: 0 が要る。
-      - name: Checkout
-        if: steps.check.outputs.unit_failed == 'true'
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.workflow_run.head_branch }}
-
-      # 【切り戻しブランチの作成】
-      #   打ち消しコミットを作り、専用ブランチとしてpushする。
-      #   main / develop には一切触れない（PR経由で人がマージする）。
+      # 【対象の特定】push か PR かを判定し、対象外ならここで打ち切る。
+      #   mode     : push … main / develop への直push（→ コミットコメント）
+      #              pr   … main / develop 宛のPR（→ PRコメント）
+      #   in_scope : この仕組みの対象かどうか（false なら以降はスキップ）
       #
-      #   status の意味（後続ステップの分岐とサマリ表示に使う）
-      #     created          : 切り戻しブランチを作成できた
-      #     skipped_existing : 同じコミットの切り戻しブランチが既にある
-      #     skipped_revert   : 対象が既に revert コミット（切り戻しの連鎖を防ぐ）
-      #     conflict         : 打ち消しがコンフリクトして自動作成できなかった
-      - name: Create revert branch
-        id: revert
+      #   PR番号の取得を2段構えにしているのは、workflow_run のペイロードに入る
+      #   pull_requests 配列が「同一リポジトリ内のPR」でしか埋まらないため。
+      #   forkからのPRでは空になるので、head_sha から引き直している。
+      - name: Resolve target (push / pull request)
+        id: target
         if: steps.check.outputs.unit_failed == 'true'
         env:
-          BAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event.workflow_run.event }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          PR_PAYLOAD: ${{ toJSON(github.event.workflow_run.pull_requests) }}
         run: |
           set -euo pipefail
 
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # --- 直push の場合: 押されたブランチがそのまま対象 ---
+          if [ "$EVENT" = "push" ]; then
+            echo "mode=push"           >> "$GITHUB_OUTPUT"
+            echo "target=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+            case "$HEAD_BRANCH" in
+              main|develop)
+                echo "in_scope=true"  >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "in_scope=false" >> "$GITHUB_OUTPUT"
+                echo "対象外ブランチへの直pushのため何もしない: $HEAD_BRANCH"
+                ;;
+            esac
+            exit 0
+          fi
 
-          SHORT="${BAD_SHA:0:7}"
-          BRANCH="revert/${SHORT}"
-          SUBJECT="$(git log -1 --pretty=format:%s "$BAD_SHA")"
-          echo "branch=$BRANCH"   >> "$GITHUB_OUTPUT"
-          echo "short=$SHORT"     >> "$GITHUB_OUTPUT"
-          echo "subject=$SUBJECT" >> "$GITHUB_OUTPUT"
+          # --- PR の場合: マージ先（base）が対象かどうかで判定する ---
+          echo "mode=pr" >> "$GITHUB_OUTPUT"
 
-          # 切り戻しコミットをさらに切り戻す連鎖を防ぐ
-          case "$SUBJECT" in
-            Revert*|revert*)
-              echo "対象が既に切り戻しコミットのため何もしない: $SUBJECT"
-              echo "status=skipped_revert" >> "$GITHUB_OUTPUT"
-              exit 0
+          # まずはペイロードから取得（APIを叩かずに済む場合が多い）
+          PR_NUMBER="$(printf '%s' "$PR_PAYLOAD" | jq -r 'first(.[]?.number) // empty')"
+
+          # forkからのPR等でペイロードが空なら、コミットに紐づくPRを引き直す
+          if [ -z "$PR_NUMBER" ]; then
+            PR_NUMBER="$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" \
+              --jq 'first(.[] | select(.state == "open") | .number) // empty' || true)"
+          fi
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "in_scope=false" >> "$GITHUB_OUTPUT"
+            echo "対応するPRを特定できなかったため何もしない (sha: $HEAD_SHA)"
+            exit 0
+          fi
+
+          BASE_REF="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.ref')"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "target=$BASE_REF"     >> "$GITHUB_OUTPUT"
+
+          case "$BASE_REF" in
+            main|develop)
+              echo "in_scope=true"  >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "in_scope=false" >> "$GITHUB_OUTPUT"
+              echo "PRのマージ先が対象外のため何もしない: $BASE_REF"
               ;;
           esac
 
-          # 同じコミットに対する切り戻しブランチが既にあるなら二重作成しない
-          if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
-            echo "既に $BRANCH が存在するため何もしない"
-            echo "status=skipped_existing" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          git switch -c "$BRANCH"
-
-          # マージコミットは「どちらの親を残すか」の指定(-m 1)が必要。
-          # 親の数で判定する。
-          PARENTS="$(git cat-file -p "$BAD_SHA" | grep -c '^parent ' || true)"
-          if [ "$PARENTS" -gt 1 ]; then
-            REVERT_OPTS="-m 1"
-          else
-            REVERT_OPTS=""
-          fi
-
-          # shellcheck disable=SC2086
-          if ! git revert --no-edit $REVERT_OPTS "$BAD_SHA"; then
-            # コンフリクトは自動解決しない。中断して人に委ねる。
-            git revert --abort || true
-            echo "切り戻しがコンフリクトしたため自動作成を中止した"
-            echo "status=conflict" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          git push origin "$BRANCH"
-          echo "status=created" >> "$GITHUB_OUTPUT"
-
-      # 【切り戻しPRの作成】自動マージはしない。人が内容を見て判断する。
-      #   本文は --body-file で渡す（シェルの引用崩れを避けるため）。
-      - name: Open revert PR
-        id: pr
-        if: steps.revert.outputs.status == 'created'
+      # 【警告コメントの投稿】push / PR で投稿先だけを切り替える。
+      #   ・履歴にもブランチにも一切触れない
+      #   ・同じコミットへの二重投稿は、本文に埋めた目印(MARKER)で防ぐ
+      #
+      #   status の意味（ジョブサマリ表示に使う）
+      #     commented        : コメントを投稿した
+      #     skipped_existing : 同じコミットのコメントが既にある
+      - name: Post warning comment
+        id: comment
+        if: >-
+          steps.check.outputs.unit_failed == 'true' &&
+          steps.target.outputs.in_scope == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BASE: ${{ github.event.workflow_run.head_branch }}
-          BRANCH: ${{ steps.revert.outputs.branch }}
-          SHORT: ${{ steps.revert.outputs.short }}
-          SUBJECT: ${{ steps.revert.outputs.subject }}
+          REPO: ${{ github.repository }}
+          MODE: ${{ steps.target.outputs.mode }}
+          TARGET: ${{ steps.target.outputs.target }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          SUBJECT: ${{ github.event.workflow_run.head_commit.message }}
+          FAILED_STEPS: ${{ steps.check.outputs.failed_steps }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
           set -euo pipefail
 
+          SHORT="${HEAD_SHA:0:7}"
+          # コミットメッセージは複数行ありうるので1行目だけ使う
+          SUBJECT_LINE="$(printf '%s' "$SUBJECT" | head -n 1)"
+
+          # HTMLコメントなので画面には出ない。重複投稿の判定にだけ使う目印。
+          MARKER="<!-- unit-test-failed:${HEAD_SHA} -->"
+
+          # 既存コメントの取得先（PRはissueコメント、pushはコミットコメント）
+          if [ "$MODE" = "pr" ]; then
+            LIST_API="repos/$REPO/issues/$PR_NUMBER/comments"
+          else
+            LIST_API="repos/$REPO/commits/$HEAD_SHA/comments"
+          fi
+
+          if gh api "$LIST_API?per_page=100" --paginate --jq '.[].body' | grep -qF "$MARKER"; then
+            echo "既に $SHORT についてコメント済みのため投稿しない"
+            echo "status=skipped_existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 本文はファイルに書き出して渡す（シェルの引用崩れを避けるため）
           {
-            echo "## 自動作成された切り戻しPR"
-            echo
-            echo "\`$BASE\` への直pushで **Unitテストが失敗した**ため、自動で作成しました。"
+            echo "$MARKER"
+
+            if [ "$MODE" = "pr" ]; then
+              echo "## ⚠️ Unitテストが失敗しています"
+              echo
+              echo "\`$SHORT\` の時点で **Unitテストが失敗**しました。**マージ前に修正してください。**"
+            else
+              echo "## 🚨 \`$TARGET\` でUnitテストが失敗しています"
+              echo
+              echo "\`$TARGET\` への直pushで **Unitテストが失敗**しました。**早急に対応してください。**"
+            fi
+
             echo
             echo "| 項目 | 内容 |"
             echo "|---|---|"
-            echo "| 対象コミット | \`$SHORT\` $SUBJECT |"
+            echo "| 対象コミット | \`$SHORT\` $SUBJECT_LINE |"
+            echo "| ブランチ | \`$HEAD_BRANCH\` |"
+            echo "| 失敗したステップ | ${FAILED_STEPS:-（取得できず）} |"
             echo "| 失敗したCI | [Tests の実行結果]($RUN_URL) |"
             echo
-            echo "### マージ前に必ず確認してください"
-            echo "1. 本当にこのコミットが原因か（テストが不安定で落ちただけではないか）"
-            echo "2. 切り戻しではなく**前進修正**のほうが適切ではないか"
-            echo "3. このコミットに依存する後続コミットが無いか"
+            echo "### 自動の切り戻しは行いません"
+
+            if [ "$MODE" = "pr" ]; then
+              echo "このPRは未マージのため、マージしなければ \`main\` / \`develop\` は壊れません。"
+            else
+              echo "このワークフローはコードに一切触れません（ブランチ作成・revert・force push なし）。"
+            fi
+
+            echo "前進修正（fix commit）と切り戻しのどちらが適切かは、担当者の判断に委ねます。"
+            echo "テストが不安定（flaky）で落ちただけでないかも併せて確認してください。"
             echo
-            echo "切り戻しが不要と判断した場合は、このPRを閉じてブランチを削除してください。"
+            echo "このコミットを打ち消す場合の手順:"
+            echo
+            echo '```bash'
+            echo "git switch $HEAD_BRANCH && git pull"
+            echo "git switch -c revert/$SHORT"
+            echo "git revert $SHORT"
+            echo "git push -u origin revert/$SHORT   # PRを作成してレビューを受ける"
+            echo '```'
             echo
             echo "---"
-            echo "*このPRは auto-revert.yml により自動生成されました。*"
-          } > "$RUNNER_TEMP/pr-body.md"
+            echo "*このコメントは auto-revert.yml により自動生成されました。*"
+          } > "$RUNNER_TEMP/comment.md"
 
-          URL="$(gh pr create \
-            --base "$BASE" \
-            --head "$BRANCH" \
-            --title "Revert \"$SUBJECT\" ($SHORT) — Unitテスト失敗のため" \
-            --body-file "$RUNNER_TEMP/pr-body.md")"
+          if [ "$MODE" = "pr" ]; then
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$RUNNER_TEMP/comment.md"
+            echo "コメントを投稿した: PR #$PR_NUMBER"
+          else
+            # コミットコメントAPIはJSONで渡す。--rawfile なら改行や引用符も安全。
+            jq -n --rawfile body "$RUNNER_TEMP/comment.md" '{body: $body}' > "$RUNNER_TEMP/payload.json"
+            gh api "repos/$REPO/commits/$HEAD_SHA/comments" \
+              --input "$RUNNER_TEMP/payload.json" --jq '.html_url'
+            echo "コメントを投稿した: commit $SHORT"
+          fi
 
-          echo "pr_url=$URL" >> "$GITHUB_OUTPUT"
-          echo "作成したPR: $URL"
+          echo "status=commented" >> "$GITHUB_OUTPUT"
 
       # 【結果の通知】何をした／しなかったのかをジョブサマリに残す。
       #   if: always() … 途中で止まった場合も理由を表示するため必ず実行する。
@@ -235,48 +289,42 @@ jobs:
         env:
           UNIT_FAILED: ${{ steps.check.outputs.unit_failed }}
           FAILED_STEPS: ${{ steps.check.outputs.failed_steps }}
-          STATUS: ${{ steps.revert.outputs.status }}
-          BRANCH: ${{ steps.revert.outputs.branch }}
-          SHORT: ${{ steps.revert.outputs.short }}
-          PR_URL: ${{ steps.pr.outputs.pr_url }}
+          MODE: ${{ steps.target.outputs.mode }}
+          IN_SCOPE: ${{ steps.target.outputs.in_scope }}
+          TARGET: ${{ steps.target.outputs.target }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          COMMENT_STATUS: ${{ steps.comment.outputs.status }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
           {
-            echo "## ⏪ 自動切り戻しの判定結果"
+            echo "## 🔔 Unitテスト失敗通知の判定結果"
             echo
             echo "- 起動元: [Tests の実行結果]($RUN_URL)"
             echo "- 失敗したステップ: ${FAILED_STEPS:-（取得できず）}"
+            echo "- 種別: ${MODE:-（判定前）} / 対象ブランチ: ${TARGET:-（判定前）}"
             echo
 
             if [ "$UNIT_FAILED" != "true" ]; then
-              echo "**切り戻しは行いませんでした。**"
+              echo "**何もしませんでした。**"
               echo
               echo "Unitテスト以外の失敗（composer install の失敗、ランナー障害など）は"
               echo "コードの問題とは限らないため、対象外としています。"
+            elif [ "${IN_SCOPE:-}" != "true" ]; then
+              echo "**何もしませんでした**（main / develop に関係しない実行のため）。"
             else
-              case "${STATUS:-}" in
-                created)
-                  echo "**切り戻しPRを作成しました: $PR_URL**"
+              case "${COMMENT_STATUS:-}" in
+                commented)
+                  if [ "${MODE:-}" = "pr" ]; then
+                    echo "**PR #${PR_NUMBER} に警告コメントを投稿しました。**"
+                  else
+                    echo "**コミット \`${HEAD_SHA:0:7}\` に警告コメントを投稿しました。**"
+                  fi
                   echo
-                  echo "> マージすると \`$SHORT\` の変更が打ち消されます。"
-                  echo "> 自動マージはしていません。内容を確認してから判断してください。"
+                  echo "> 自動の切り戻しは行いません。対応方針は担当者が判断してください。"
                   ;;
                 skipped_existing)
-                  echo "**何もしませんでした**（\`$BRANCH\` が既に存在するため）。"
-                  ;;
-                skipped_revert)
-                  echo "**何もしませんでした**（対象が既に切り戻しコミットのため）。"
-                  ;;
-                conflict)
-                  echo "**自動作成に失敗しました（コンフリクト）。**"
-                  echo
-                  echo "手動での対応が必要です:"
-                  echo '```bash'
-                  echo "git switch main && git pull"
-                  echo "git switch -c revert/$SHORT"
-                  echo "git revert $SHORT   # コンフリクトを解消してコミット"
-                  echo "git push -u origin revert/$SHORT"
-                  echo '```'
+                  echo "**何もしませんでした**（同じコミットのコメントが既にあるため）。"
                   ;;
                 *)
                   echo "**判定できませんでした。** 上のステップのログを確認してください。"
