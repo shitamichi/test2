@@ -19,7 +19,7 @@
 #   claude.yml : Issue / PRコメントの @claude メンションに応答する
 #
 # 【コストに注意】
-#   このワークフローは push / プルリクのたびに Claude を1回呼ぶ。
+#   このワークフローはプルリクが作られる / 更新されるたびに Claude を1回呼ぶ。
 #   （CLAUDE_CODE_OAUTH_TOKEN のサブスク枠、またはAPI従量課金を消費する）
 #   呼び出し回数を減らしたい場合は下の on: を調整する。
 # ============================================================================
@@ -28,19 +28,32 @@
 # tests.yml の "Tests" と区別できるよう、役割がわかる名前にしている。
 name: Commit Summary
 
-# 【いつ動かすか】のトリガー設定。tests.yml と同じ条件にそろえてある。
-#   push         : develop / main ブランチに直接コミットが入ったとき
+# 【いつ動かすか】のトリガー設定。
 #   pull_request : develop / main 宛てのプルリクが作られた・更新されたとき
 #
-#   ※ コストを下げたい場合の調整ポイント（どちらもこのファイルだけで完結する）
-#     ・プルリク時だけにする  … 下の push: ブロックをまるごと削除する
+# 【重要】push は指定できない（指定すると必ず失敗する）
+#   claude-code-action@v1 は対応イベントが決まっており、push は含まれていない。
+#   push を書くと実行時に
+#     Error: Action failed with error: Unsupported event type: push
+#   で落ちる（実際に一度踏んだ）。
+#   アクションが受け付けるイベントは以下のみ:
+#     issues / issue_comment / pull_request（pull_request_target 含む）/
+#     pull_request_review / pull_request_review_comment /
+#     workflow_dispatch / repository_dispatch / schedule / workflow_run
+#
+#   → develop / main への直pushでも要約を出したくなった場合は、
+#     tests.yml の完了を拾う workflow_run トリガに作り替える必要がある
+#     （二重実行を避ける if: 条件と、checkout への head_sha 明示指定が要る）。
+#
+#   ※ コストを下げたい場合の調整ポイント
 #     ・PRを開いた初回だけにする
 #       → pull_request: に types: [opened] を追加する
 #         （既定は [opened, synchronize, reopened] で、
 #           コミットを追加するたびに再実行される）
 on:
-  push:
-    branches: [develop, main]
+  # push:                      # del start（claude-code-action が push 非対応のため削除）
+  #   branches: [develop, main]
+  #                            # del end
   pull_request:
     branches: [develop, main]
 
@@ -71,7 +84,9 @@ jobs:
 
       # 【差分の収集】Claudeに読ませる材料を1つのテキストファイルにまとめる。
       #   プルリク時 : ベースブランチ（develop/main）との差分
-      #   push時     : push前後の差分（github.event.before 〜 github.sha）
+      #
+      #   下の else 側は、将来 workflow_dispatch などPR以外のイベントを
+      #   追加したときのフォールバック。今のトリガ設定では通らない。
       #
       #   ※ ${{ }} の値を run: の中に直接埋め込むとスクリプト injection の
       #     リスクがあるため、必ず env: 経由で環境変数として受け取る。
